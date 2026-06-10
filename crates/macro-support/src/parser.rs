@@ -120,6 +120,7 @@ macro_rules! attrgen {
             (typescript_type, false, TypeScriptType(Span, String, Span)),
             (getter_with_clone, false, GetterWithClone(Span)),
             (instantiate, false, Instantiate(Span, Vec<Instantiation>)),
+            (typescript_type_params, false, TsTypeParams(Span, String, Span)),
             (static_string, false, StaticString(Span)),
             (thread_local, false, ThreadLocal(Span)),
             (thread_local_v2, false, ThreadLocalV2(Span)),
@@ -559,6 +560,11 @@ impl Parse for AnyIdent {
 pub struct Instantiation {
     pub(crate) ty: syn::TypePath,
     pub(crate) js_name: Ident,
+    /// TypeScript-level type parameters on the exported class, from the
+    /// `as Tr<P>` form. The runtime class stays erased; the generated
+    /// `.d.ts` declares `class Tr<P = any>` and method positions whose
+    /// original type was the corresponding Rust parameter are typed `P`.
+    pub(crate) ts_params: Vec<Ident>,
 }
 
 impl Parse for Instantiation {
@@ -566,7 +572,18 @@ impl Parse for Instantiation {
         let ty: syn::TypePath = input.parse()?;
         input.parse::<Token![as]>()?;
         let js_name = input.parse::<AnyIdent>()?.0;
-        Ok(Instantiation { ty, js_name })
+        let mut ts_params = Vec::new();
+        if input.peek(Token![<]) {
+            input.parse::<Token![<]>()?;
+            loop {
+                ts_params.push(input.parse::<AnyIdent>()?.0);
+                if input.parse::<Option<Token![,]>>()?.is_none() {
+                    break;
+                }
+            }
+            input.parse::<Token![>]>()?;
+        }
+        Ok(Instantiation { ty, js_name, ts_params })
     }
 }
 
@@ -577,6 +594,9 @@ pub(crate) struct InstantiationTarget {
     pub(crate) js_name: String,
     pub(crate) args: syn::AngleBracketedGenericArguments,
     renames: Vec<(Ident, syn::Type)>,
+    /// Pairs of (Rust generic parameter, TS type parameter name) for
+    /// TS-generic instantiations (`as Tr<P>`); empty otherwise.
+    pub(crate) ts_params: Vec<(Ident, String)>,
 }
 
 impl InstantiationTarget {
@@ -615,6 +635,7 @@ pub(crate) fn concrete_impl_target(
             Ident::new("Self", Span::call_site()),
             syn::Type::Path(concrete.clone()),
         )],
+        ts_params: Vec::new(),
     })
 }
 
@@ -698,6 +719,19 @@ pub(crate) fn instantiation_target(
             js_name
         );
     }
+    if !inst.ts_params.is_empty() && inst.ts_params.len() != params.len() {
+        bail_span!(
+            inst.js_name,
+            "expected {} TypeScript type parameter(s) to mirror `<{}>` positionally, found {}",
+            params.len(),
+            params
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            inst.ts_params.len()
+        );
+    }
     let mut turbofish = args.clone();
     turbofish.colon2_token = Some(Default::default());
 
@@ -711,11 +745,17 @@ pub(crate) fn instantiation_target(
             self_ty,
         )))
         .collect();
+    let ts_params = params
+        .iter()
+        .zip(inst.ts_params.iter())
+        .map(|(param, ts)| ((*param).clone(), ts.unraw().to_string()))
+        .collect();
 
     Ok(InstantiationTarget {
         js_name,
         args: turbofish,
         renames,
+        ts_params,
     })
 }
 
@@ -1004,6 +1044,9 @@ impl ConvertToAst<&ast::Program> for &mut syn::ItemStruct {
                 Ok(ast::Struct {
                     rust_name: self.ident.clone(),
                     rust_generics: target.map(|t| t.args.clone()),
+                    ts_params: target
+                        .map(|t| t.ts_params.iter().map(|(_, ts)| ts.clone()).collect())
+                        .unwrap_or_default(),
                     js_name,
                     qualified_name,
                     fields,
@@ -1861,6 +1904,7 @@ fn function_from_decl(
             generate_typescript: opts.skip_typescript().is_none(),
             generate_jsdoc: opts.skip_jsdoc().is_none(),
             variadic: opts.variadic().is_some(),
+            ts_params: opts.typescript_type_params().map(|(s, _)| s.to_string()),
             ret,
             arguments: arguments
                 .into_iter()
@@ -2420,7 +2464,12 @@ fn prepare_for_impl_recursion(
             let inst_tokens = insts.iter().map(|inst| {
                 let ty = &inst.ty;
                 let js_name = &inst.js_name;
-                quote::quote! { #ty as #js_name }
+                let ts_params = &inst.ts_params;
+                if ts_params.is_empty() {
+                    quote::quote! { #ty as #js_name }
+                } else {
+                    quote::quote! { #ty as #js_name<#(#ts_params),*> }
+                }
             });
             quote::quote! { , generics = [ #(#params),* ], instantiate = [ #(#inst_tokens),* ] }
         }
@@ -2528,11 +2577,15 @@ impl MacroParse<&ClassMarker> for &mut syn::ImplItemFn {
         };
 
         for (js_class, target) in targets {
+            let auto = target
+                .as_ref()
+                .filter(|t| !t.ts_params.is_empty())
+                .map(|t| auto_ts_overrides(&self.sig, t, class));
             let mut sig = self.sig.clone();
             if let Some(target) = &target {
                 substitute_signature_types(&mut sig, target)?;
             }
-            let (function, method_self) = function_from_decl(
+            let (mut function, method_self) = function_from_decl(
                 &self.sig.ident,
                 &opts,
                 sig,
@@ -2541,7 +2594,30 @@ impl MacroParse<&ClassMarker> for &mut syn::ImplItemFn {
                 FunctionPosition::Impl { self_ty: class },
                 Some(args_attrs.clone()),
             )?;
-            let method_kind = if opts.constructor().is_some() {
+            let is_constructor = opts.constructor().is_some();
+            if let Some(auto) = auto {
+                for (arg, auto_ty) in function.arguments.iter_mut().zip(&auto.args) {
+                    if arg.js_type.is_none() {
+                        arg.js_type = auto_ty.clone();
+                    }
+                }
+                if !is_constructor {
+                    if let (Some(ret), Some(auto_ty)) = (function.ret.as_mut(), &auto.ret) {
+                        if ret.js_type.is_none() {
+                            ret.js_type = Some(auto_ty.clone());
+                        }
+                    }
+                }
+                let is_static = method_self.is_none() && !is_constructor;
+                if is_static && !auto.used_params.is_empty() {
+                    let auto_params = auto.used_params.join(", ");
+                    function.ts_params = Some(match function.ts_params.take() {
+                        Some(manual) => format!("{auto_params}, {manual}"),
+                        None => auto_params,
+                    });
+                }
+            }
+            let method_kind = if is_constructor {
                 ast::MethodKind::Constructor
             } else {
                 let is_static = method_self.is_none();
@@ -2572,6 +2648,135 @@ impl MacroParse<&ClassMarker> for &mut syn::ImplItemFn {
         }
         opts.check_used();
         Ok(())
+    }
+}
+
+/// Per-method TypeScript overrides for a TS-generic instantiation
+/// (`instantiate(Tr<JsValue> as Tr<P>)`), computed from the *original*
+/// generic signature: positions whose type is exactly a Rust type parameter
+/// are typed as the corresponding TS parameter, and positions that are
+/// `Self` (or the base type applied to exactly the parameters) are typed
+/// `Name<P, ...>`. Existing `unchecked_*_type` overrides take precedence.
+struct AutoTsOverrides {
+    /// One entry per typed argument, in order.
+    args: Vec<Option<String>>,
+    ret: Option<String>,
+    /// TS parameters referenced by the overrides, in class declaration
+    /// order. Static methods must redeclare these as method-level type
+    /// parameters — TypeScript statics cannot reference class type params.
+    used_params: Vec<String>,
+}
+
+fn auto_ts_overrides(
+    sig: &syn::Signature,
+    target: &InstantiationTarget,
+    class_ident: &Ident,
+) -> AutoTsOverrides {
+    fn mark_used(used: &mut Vec<String>, ts: &str) {
+        if !used.iter().any(|u| u == ts) {
+            used.push(ts.to_string());
+        }
+    }
+
+    let class_ts_string = || {
+        format!(
+            "{}<{}>",
+            target.js_name,
+            target
+                .ts_params
+                .iter()
+                .map(|(_, ts)| ts.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+
+    let args_are_exactly_params = |args: &syn::AngleBracketedGenericArguments| {
+        args.args.len() == target.ts_params.len()
+            && args
+                .args
+                .iter()
+                .zip(target.ts_params.iter())
+                .all(|(arg, (param, _))| match arg {
+                    syn::GenericArgument::Type(syn::Type::Path(tp)) => {
+                        tp.qself.is_none() && tp.path.is_ident(param)
+                    }
+                    _ => false,
+                })
+    };
+
+    let ts_for_type = |ty: &syn::Type, used: &mut Vec<String>| -> Option<String> {
+        let mut ty = ty;
+        loop {
+            match ty {
+                syn::Type::Group(g) => ty = &g.elem,
+                syn::Type::Paren(p) => ty = &p.elem,
+                syn::Type::Reference(r) => ty = &r.elem,
+                _ => break,
+            }
+        }
+        let syn::Type::Path(tp) = ty else { return None };
+        if tp.qself.is_some() || tp.path.segments.len() != 1 {
+            return None;
+        }
+        let segment = tp.path.segments.last().unwrap();
+        match &segment.arguments {
+            syn::PathArguments::None => {
+                if segment.ident == "Self" {
+                    for (_, ts) in &target.ts_params {
+                        mark_used(used, ts);
+                    }
+                    Some(class_ts_string())
+                } else {
+                    let ts = target
+                        .ts_params
+                        .iter()
+                        .find(|(param, _)| segment.ident == *param)
+                        .map(|(_, ts)| ts.clone())?;
+                    mark_used(used, &ts);
+                    Some(ts)
+                }
+            }
+            syn::PathArguments::AngleBracketed(args) => {
+                if segment.ident == *class_ident && args_are_exactly_params(args) {
+                    for (_, ts) in &target.ts_params {
+                        mark_used(used, ts);
+                    }
+                    Some(class_ts_string())
+                } else {
+                    None
+                }
+            }
+            syn::PathArguments::Parenthesized(_) => None,
+        }
+    };
+
+    let mut used: Vec<String> = Vec::new();
+    let args = sig
+        .inputs
+        .iter()
+        .filter_map(|input| match input {
+            syn::FnArg::Typed(pat_type) => Some(ts_for_type(&pat_type.ty, &mut used)),
+            syn::FnArg::Receiver(_) => None,
+        })
+        .collect();
+    let ret = match &sig.output {
+        syn::ReturnType::Type(_, ty) => ts_for_type(ty, &mut used),
+        syn::ReturnType::Default => None,
+    };
+
+    let used_params = target
+        .ts_params
+        .iter()
+        .map(|(_, ts)| ts)
+        .filter(|ts| used.iter().any(|u| &u == ts))
+        .cloned()
+        .collect();
+
+    AutoTsOverrides {
+        args,
+        ret,
+        used_params,
     }
 }
 

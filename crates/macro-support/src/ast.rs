@@ -469,6 +469,11 @@ pub struct Function {
     pub generate_jsdoc: bool,
     /// Whether this is a function with a variadict parameter
     pub variadic: bool,
+    /// Free-form TypeScript type parameters to declare on this function in
+    /// the generated `.d.ts` (e.g. `Q` or `Q extends Foo`), spliced as
+    /// `name<...>(...)`. Set via `typescript_type_params = "..."` or
+    /// auto-populated for static methods of TS-generic instantiations.
+    pub ts_params: Option<String>,
 }
 
 /// Information about a function's return
@@ -514,6 +519,10 @@ pub struct Struct {
     /// generic struct, in turbofish form (e.g. `::<f64>` so the full type is
     /// `Tr::<f64>`). `None` for ordinary non-generic structs.
     pub rust_generics: Option<syn::AngleBracketedGenericArguments>,
+    /// TypeScript-level type parameter names declared on the generated class
+    /// (`class Tr<P = any>`), from an `instantiate(Tr<JsValue> as Tr<P>)`
+    /// entry. Runtime stays erased; only the `.d.ts` is generic.
+    pub ts_params: Vec<String>,
     /// The export name of the struct in JS code
     pub js_name: String,
     /// The namespace-qualified internal name used for wasm symbol generation.

@@ -271,6 +271,9 @@ struct ExportedClass {
     js_namespace: Option<Vec<String>>,
     /// The JS-facing name of this class (used for JS output)
     js_name: Option<String>,
+    /// TypeScript-level type parameter names (`class Tr<P = any>`); the
+    /// JS class itself is unparameterized.
+    ts_params: Vec<String>,
     /// The JS name of the parent class this class extends, if any.
     /// Sourced from `AuxStruct.extends` via the `#[wasm_bindgen(extends)]`
     /// attribute on an exported Rust struct. The parent class is expected
@@ -2050,11 +2053,26 @@ if (require('worker_threads').isMainThread) {{
             Some(parent_id) => format!("class {identifier} extends {parent_id} {{\n"),
             None => format!("class {identifier} {{\n"),
         };
+        // TS-level type parameters default to `any` so unparameterized
+        // references to the class elsewhere in the declarations stay valid.
+        let ts_param_list = if class.ts_params.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "<{}>",
+                class
+                    .ts_params
+                    .iter()
+                    .map(|p| format!("{p} = any"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
         let mut ts_dst = match &parent_identifier {
             Some(parent_id) if parent_ts_visible => {
-                format!("class {identifier} extends {parent_id} {{\n")
+                format!("class {identifier}{ts_param_list} extends {parent_id} {{\n")
             }
-            _ => format!("class {identifier} {{\n"),
+            _ => format!("class {identifier}{ts_param_list} {{\n"),
         };
 
         if !class.has_constructor {
@@ -4580,6 +4598,7 @@ if (require('worker_threads').isMainThread) {{
                 .entry(qualified_name.clone())
                 .or_default();
             class.js_name = Some(s.name.clone());
+            class.ts_params = s.ts_params.clone();
             // Pre-populate extends so the constructor binding (emitted while
             // processing adapters below) can tell whether a class is a
             // subclass and needs `super(__wbgSuperSkip)`. The same field is
@@ -5042,6 +5061,12 @@ addToLibrary({
                 assert!(!catch);
                 assert!(!log_error);
 
+                // Splice function-level TypeScript type parameters
+                // (`name<Q>(...)`) in front of the signature.
+                let ts_sig = match &export.fn_ts_params {
+                    Some(params) => format!("<{params}>{ts_sig}"),
+                    None => ts_sig,
+                };
                 let ts_sig = export.generate_typescript.then_some(ts_sig.as_str());
 
                 // only include `ts_doc` for format if there were arguments or a return var description

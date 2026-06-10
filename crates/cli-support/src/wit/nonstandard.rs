@@ -119,6 +119,9 @@ pub struct AuxExport {
     pub fn_ret_ty_override: Option<String>,
     /// Function's return description
     pub fn_ret_desc: Option<String>,
+    /// Free-form TypeScript type parameters declared on this function in
+    /// the generated `.d.ts`, spliced as `name<...>(...)`.
+    pub fn_ts_params: Option<String>,
 }
 
 /// Information about a functions' argument
@@ -313,6 +316,10 @@ pub struct AuxStruct {
     /// via `extends_js_namespace = ...`. Required when the parent struct
     /// uses `js_namespace`.
     pub extends_js_namespace: Option<Vec<String>>,
+    /// TypeScript-level type parameter names declared on the generated
+    /// class (`class Tr<P = any>`). Runtime stays erased; only the `.d.ts`
+    /// is generic.
+    pub ts_params: Vec<String>,
 }
 
 /// All possible types of imports that can be imported by a Wasm module.

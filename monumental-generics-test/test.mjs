@@ -67,3 +67,22 @@ assert.strictEqual(typeof PlanDebug.prototype.evaluate, "undefined");
 assert.strictEqual(typeof CheckInput.prototype.result, "undefined");
 
 console.log("typestate assertions passed");
+
+// --- TS-generic erased class (geom Tr replica) ---
+const { Frame } = require("./pkg/wbg_generics_test.js");
+
+const f = new Frame({ name: "wall" }, 4);
+assert.strictEqual(f.local.name, "wall");
+assert.strictEqual(f.scale, 4);
+const mapped = f.map((p) => p.name.length);
+assert.ok(mapped instanceof Frame);
+assert.strictEqual(mapped.local, 4);
+assert.strictEqual(mapped.scale, 4);
+const o = Frame.o3([1, 2]);
+assert.deepStrictEqual(o.local, [1, 2]);
+assert.strictEqual(o.scaled(3).scale, 3);
+assert.strictEqual(f.halved().scale, 2);
+assert.strictEqual(o.halved(), undefined);
+assert.strictEqual(f.replace("x").local, "x");
+
+console.log("ts-generic frame assertions passed");

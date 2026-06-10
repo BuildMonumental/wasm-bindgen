@@ -140,6 +140,9 @@ struct ClassMarker {
     generics: Vec<syn::Ident>,
     /// For a generic impl block: the requested monomorphizations.
     instantiations: Vec<parser::Instantiation>,
+    /// For a concrete impl of one instantiation (`impl Foo<Evaluated>` with
+    /// `js_class`): the full concrete self type.
+    concrete: Option<syn::TypePath>,
     wasm_bindgen: syn::Path,
     wasm_bindgen_futures: syn::Path,
     js_sys: syn::Path,
@@ -158,6 +161,7 @@ impl Parse for ClassMarker {
         let mut js_namespace: Option<Vec<String>> = None;
         let mut generics: Vec<syn::Ident> = Vec::new();
         let mut instantiations: Vec<parser::Instantiation> = Vec::new();
+        let mut concrete: Option<syn::TypePath> = None;
         let mut wasm_bindgen = None;
         let mut wasm_bindgen_futures = None;
         let mut js_sys = None;
@@ -180,6 +184,12 @@ impl Parse for ClassMarker {
                     let insts: syn::punctuated::Punctuated<parser::Instantiation, Token![,]> =
                         content.parse_terminated(parser::Instantiation::parse, Token![,])?;
                     instantiations = insts.into_iter().collect();
+                } else if ident == "concrete" {
+                    if concrete.is_some() {
+                        return Err(syn::Error::new(ident.span(), "found duplicate `concrete`"));
+                    }
+                    input.parse::<Token![=]>()?;
+                    concrete = Some(input.parse::<syn::TypePath>()?);
                 } else if ident == "js_namespace" {
                     if js_namespace.is_some() {
                         return Err(syn::Error::new(
@@ -237,6 +247,7 @@ impl Parse for ClassMarker {
             js_namespace,
             generics,
             instantiations,
+            concrete,
             wasm_bindgen: wasm_bindgen.unwrap_or_else(|| syn::parse_quote! { wasm_bindgen }),
             wasm_bindgen_futures: wasm_bindgen_futures
                 .unwrap_or_else(|| syn::parse_quote! { wasm_bindgen_futures }),

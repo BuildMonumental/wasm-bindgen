@@ -1,0 +1,17 @@
+[package]
+name = "wbg-generics-test"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wasm-bindgen = { path = ".." }
+
+[profile.release]
+opt-level = 1
+
+# Detach from the wasm-bindgen workspace at the repo root so this crate
+# builds standalone against the fork without being pulled in as a member.
+[workspace]

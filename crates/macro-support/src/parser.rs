@@ -590,6 +590,34 @@ impl InstantiationTarget {
     }
 }
 
+/// Builds the target for a concrete impl block (`impl Foo<Evaluated>` with
+/// `js_class = "FooDebug"`): no generic parameters to substitute, only `Self`
+/// rewritten to the concrete type, with the self type's generic arguments
+/// carried through for shim generation.
+pub(crate) fn concrete_impl_target(
+    concrete: &syn::TypePath,
+    js_class: &str,
+) -> Result<InstantiationTarget, Diagnostic> {
+    let segment = concrete.path.segments.last().unwrap();
+    let args = match &segment.arguments {
+        syn::PathArguments::AngleBracketed(args) => args,
+        _ => bail_span!(
+            segment,
+            "internal error: concrete impl target without generic arguments"
+        ),
+    };
+    let mut turbofish = args.clone();
+    turbofish.colon2_token = Some(Default::default());
+    Ok(InstantiationTarget {
+        js_name: js_class.to_string(),
+        args: turbofish,
+        renames: vec![(
+            Ident::new("Self", Span::call_site()),
+            syn::Type::Path(concrete.clone()),
+        )],
+    })
+}
+
 /// Validates that `generics` contains only plain type parameters and returns
 /// their identifiers. Lifetimes and const parameters cannot be monomorphized
 /// through `instantiate`.
@@ -2145,8 +2173,45 @@ impl MacroParse<BindgenAttrs> for &mut syn::ItemImpl {
             ),
         };
 
+        // An impl whose self type carries concrete generic arguments (e.g.
+        // `impl Action<Evaluated>`) but has no impl-level type parameters
+        // attaches its methods to one specific instantiation's exported
+        // class. The macro cannot see the struct's `instantiate` list
+        // cross-invocation, so the target JS class must be named explicitly
+        // via `js_class`; a mismatch with the struct's declared instantiation
+        // surfaces as a missing-ABI-impl compile error on the shims.
+        let concrete_self_ty = if self.generics.params.is_empty() {
+            match &name.segments.last().unwrap().arguments {
+                syn::PathArguments::AngleBracketed(_) => {
+                    if opts.instantiate().is_some() {
+                        bail_span!(
+                            &self.self_ty,
+                            "use `js_class = \"...\"` (not `instantiate`) to attach a \
+                             concrete impl to one instantiation's exported class"
+                        );
+                    }
+                    if opts.js_class().is_none() {
+                        bail_span!(
+                            &self.self_ty,
+                            "an impl for a concrete instantiation of a generic struct \
+                             must name the exported class it attaches to, e.g. \
+                             `#[wasm_bindgen(js_class = \"MyClassName\")]` matching the \
+                             struct's `instantiate(... as MyClassName)` entry"
+                        );
+                    }
+                    Some(syn::TypePath {
+                        qself: None,
+                        path: name.clone(),
+                    })
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         let generic_params = if self.generics.params.is_empty() {
-            if opts.instantiate().is_some() {
+            if concrete_self_ty.is_none() && opts.instantiate().is_some() {
                 bail_span!(
                     &self.self_ty,
                     "`instantiate` requires the impl block to have generic type parameters"
@@ -2197,6 +2262,7 @@ impl MacroParse<BindgenAttrs> for &mut syn::ItemImpl {
                 program,
                 &opts,
                 generic_params.as_ref(),
+                concrete_self_ty.as_ref(),
             ) {
                 errors.push(e);
             }
@@ -2275,6 +2341,7 @@ fn prepare_for_impl_recursion(
     program: &ast::Program,
     impl_opts: &BindgenAttrs,
     generic_params: Option<&(Vec<Ident>, Vec<Instantiation>)>,
+    concrete_self_ty: Option<&syn::TypePath>,
 ) -> Result<(), Diagnostic> {
     let method = match item {
         syn::ImplItem::Fn(m) => m,
@@ -2348,8 +2415,8 @@ fn prepare_for_impl_recursion(
         quote::quote! { , js_namespace = [ #(#js_namespace_lits),* ] }
     };
 
-    let generics_tokens = match generic_params {
-        Some((params, insts)) => {
+    let generics_tokens = match (generic_params, concrete_self_ty) {
+        (Some((params, insts)), _) => {
             let inst_tokens = insts.iter().map(|inst| {
                 let ty = &inst.ty;
                 let js_name = &inst.js_name;
@@ -2357,7 +2424,8 @@ fn prepare_for_impl_recursion(
             });
             quote::quote! { , generics = [ #(#params),* ], instantiate = [ #(#inst_tokens),* ] }
         }
-        None => quote::quote! {},
+        (None, Some(concrete)) => quote::quote! { , concrete = #concrete },
+        (None, None) => quote::quote! {},
     };
 
     let wasm_bindgen = &program.wasm_bindgen;
@@ -2386,6 +2454,7 @@ impl MacroParse<&ClassMarker> for &mut syn::ImplItemFn {
             js_namespace,
             generics,
             instantiations,
+            concrete,
             wasm_bindgen,
             wasm_bindgen_futures,
             js_sys,
@@ -2436,9 +2505,16 @@ impl MacroParse<&ClassMarker> for &mut syn::ImplItemFn {
 
         // A generic impl is expanded once per instantiation, substituting the
         // impl's type parameters (and `Self`) with the instantiation's
-        // concrete types in the method signature. A non-generic impl is the
+        // concrete types in the method signature. A concrete impl of one
+        // instantiation (`impl Foo<Evaluated>` + `js_class`) is a single
+        // target with only `Self` rewritten. A non-generic impl is the
         // single-target trivial case.
-        let targets: Vec<(String, Option<InstantiationTarget>)> = if instantiations.is_empty() {
+        let targets: Vec<(String, Option<InstantiationTarget>)> = if let Some(concrete) = concrete {
+            vec![(
+                js_class.to_string(),
+                Some(concrete_impl_target(concrete, js_class)?),
+            )]
+        } else if instantiations.is_empty() {
             vec![(js_class.to_string(), None)]
         } else {
             let param_refs: Vec<&Ident> = generics.iter().collect();

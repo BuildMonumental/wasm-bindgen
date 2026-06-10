@@ -116,6 +116,9 @@ pub struct Export {
     pub method_self: Option<MethodSelf>,
     /// The struct name, in Rust, this is attached to
     pub rust_class: Option<Ident>,
+    /// The concrete generic arguments of the monomorphized struct this export
+    /// is attached to, in turbofish form. Mirrors [`Struct::rust_generics`].
+    pub rust_class_generics: Option<syn::AngleBracketedGenericArguments>,
     /// The name of the rust function/method on the rust side.
     pub rust_name: Ident,
     /// Whether or not this function should be flagged as the Wasm start
@@ -507,6 +510,10 @@ pub struct FunctionArgumentData {
 pub struct Struct {
     /// The name of the struct in Rust code
     pub rust_name: Ident,
+    /// The concrete generic arguments of a monomorphized instantiation of a
+    /// generic struct, in turbofish form (e.g. `::<f64>` so the full type is
+    /// `Tr::<f64>`). `None` for ordinary non-generic structs.
+    pub rust_generics: Option<syn::AngleBracketedGenericArguments>,
     /// The export name of the struct in JS code
     pub js_name: String,
     /// The namespace-qualified internal name used for wasm symbol generation.
@@ -555,6 +562,9 @@ pub struct StructField {
     pub js_name: String,
     /// The name of the struct this field is part of
     pub struct_name: Ident,
+    /// The concrete generic arguments of the monomorphized struct this field
+    /// is part of, in turbofish form. Mirrors [`Struct::rust_generics`].
+    pub struct_generics: Option<syn::AngleBracketedGenericArguments>,
     /// Whether this value is read-only to JS
     pub readonly: bool,
     /// The type of this field

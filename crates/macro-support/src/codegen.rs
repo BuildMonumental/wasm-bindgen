@@ -218,7 +218,11 @@ impl TryToTokens for ast::LinkToModule {
 
 impl ToTokens for ast::Struct {
     fn to_tokens(&self, tokens: &mut TokenStream) {
-        let name = &self.rust_name;
+        let rust_ident = &self.rust_name;
+        let rust_generics = &self.rust_generics;
+        // The full (possibly monomorphized) type, e.g. `Foo` or `Tr::<f64>`.
+        // Turbofish syntax is valid in both type and expression position.
+        let name = quote! { #rust_ident #rust_generics };
         let name_str = self.qualified_name.to_string();
         let name_len = name_str.len() as u32;
         let name_chars: Vec<u32> = name_str.chars().map(|c| c as u32).collect();
@@ -548,7 +552,9 @@ impl ToTokens for ast::StructField {
         }
 
         let rust_name = &self.rust_name;
-        let struct_name = &self.struct_name;
+        let struct_ident = &self.struct_name;
+        let struct_generics = &self.struct_generics;
+        let struct_name = quote! { #struct_ident #struct_generics };
         let ty = &self.ty;
         let getter = &self.getter;
         let setter = &self.setter;
@@ -657,13 +663,20 @@ impl TryToTokens for ast::Export {
 
         let name = &self.rust_name;
         let wasm_bindgen = &self.wasm_bindgen;
+        // The full (possibly monomorphized) type of the class this export is
+        // attached to, e.g. `Foo` or `Tr::<f64>`. Turbofish syntax is valid
+        // in both type and expression position.
+        let rust_class = self.rust_class.as_ref().map(|class| {
+            let generics = &self.rust_class_generics;
+            quote! { #class #generics }
+        });
 
         let offset = if self.method_self.is_some() {
             if matches!(self.method_self, Some(ast::MethodSelf::ByValue)) {
-                let class = self.rust_class.as_ref().unwrap();
+                let class = rust_class.as_ref().unwrap();
                 args.push(quote! { me: <#class as #wasm_bindgen::convert::FromWasmAbi>::Abi });
             } else {
-                let class = self.rust_class.as_ref().unwrap();
+                let class = rust_class.as_ref().unwrap();
                 let abi = match self.method_self {
                     Some(ast::MethodSelf::RefMutable) => {
                         quote! { <#class as #wasm_bindgen::convert::RefMutFromWasmAbi>::Abi }
@@ -692,7 +705,7 @@ impl TryToTokens for ast::Export {
         };
         let receiver = match self.method_self {
             Some(ast::MethodSelf::ByValue) => {
-                let class = self.rust_class.as_ref().unwrap();
+                let class = rust_class.as_ref().unwrap();
                 arg_conversions.push(quote! {
                     // Owned `self` is consumed inside the catch-unwind closure;
                     // assert it's `UnwindSafe` so a panic mid-method doesn't
@@ -705,7 +718,7 @@ impl TryToTokens for ast::Export {
                 quote! { me.#name }
             }
             Some(ast::MethodSelf::RefMutable) => {
-                let class = self.rust_class.as_ref().unwrap();
+                let class = rust_class.as_ref().unwrap();
                 arg_conversions.push(quote! {
                     // `&mut self` requires `Self: RefUnwindSafe` (logical
                     // unwind-safety): if the method panics partway through
@@ -727,7 +740,7 @@ impl TryToTokens for ast::Export {
                 quote! { me.#name }
             }
             Some(ast::MethodSelf::RefShared) => {
-                let class = self.rust_class.as_ref().unwrap();
+                let class = rust_class.as_ref().unwrap();
                 let (trait_, func, borrow) = if self.function.r#async {
                     (
                         quote!(LongRefFromWasmAbi),
@@ -754,7 +767,7 @@ impl TryToTokens for ast::Export {
                 });
                 quote! { me.#name }
             }
-            None => match &self.rust_class {
+            None => match &rust_class {
                 Some(class) => quote! { #class::#name },
                 None => quote! { #name },
             },
@@ -960,7 +973,7 @@ impl TryToTokens for ast::Export {
             checks.push(quote! { const _ASSERT: fn() = || -> #projection::Abi { loop {} }; });
         };
 
-        if let Some(class) = self.rust_class.as_ref() {
+        if let Some(class) = rust_class.as_ref() {
             // little helper function to make sure the check points to the
             // location of the function causing the assert to fail
             let mut add_check = |token_stream| {

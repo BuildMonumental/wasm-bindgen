@@ -717,6 +717,7 @@ impl<'a> Context<'a> {
                 variadic: export.function.variadic,
                 fn_ret_ty_override: export.function.ret_ty_override.map(String::from),
                 fn_ret_desc: export.function.ret_desc.map(String::from),
+                fn_ts_params: export.function.ts_params.map(String::from),
             },
         );
         Ok(())
@@ -1294,6 +1295,7 @@ impl<'a> Context<'a> {
                     variadic: false,
                     fn_ret_ty_override: None,
                     fn_ret_desc: None,
+                    fn_ts_params: None,
                 },
             );
 
@@ -1329,6 +1331,7 @@ impl<'a> Context<'a> {
                     variadic: false,
                     fn_ret_ty_override: None,
                     fn_ret_desc: None,
+                    fn_ts_params: None,
                 },
             );
         }
@@ -1344,6 +1347,7 @@ impl<'a> Context<'a> {
             private: struct_.private,
             extends: struct_.extends.map(|s| s.to_string()),
             extends_js_class: struct_.extends_js_class.map(|s| s.to_string()),
+            ts_params: struct_.ts_params.iter().map(|s| s.to_string()).collect(),
             extends_js_namespace: struct_
                 .extends_js_namespace
                 .as_ref()

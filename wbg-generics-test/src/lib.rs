@@ -181,3 +181,60 @@ impl Plan<Evaluated> {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// TS-generic instantiation: runtime erased to JsValue, the generated .d.ts
+// declares `class Frame<P = any>` with P in the positions where the Rust
+// signature used the type parameter.
+
+#[wasm_bindgen(instantiate(Frame<JsValue> as Frame<P>))]
+#[derive(Clone, Debug)]
+pub struct Frame<P> {
+    #[wasm_bindgen(skip)]
+    pub local: P,
+    pub scale: f64,
+}
+
+#[wasm_bindgen(instantiate(Frame<JsValue> as Frame<P>))]
+impl<P: Clone> Frame<P> {
+    #[wasm_bindgen(constructor)]
+    pub fn new(local: P, scale: f64) -> Self {
+        Frame { local, scale }
+    }
+
+    pub fn o3(local: P) -> Frame<P> {
+        Frame { local, scale: 1.0 }
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn local(&self) -> P {
+        self.local.clone()
+    }
+
+    pub fn scaled(&self, factor: f64) -> Frame<P> {
+        Frame { local: self.local.clone(), scale: self.scale * factor }
+    }
+
+    pub fn replace(&self, local: P) -> Self {
+        Frame { local, scale: self.scale }
+    }
+
+    pub fn halved(&self) -> Option<Frame<P>> {
+        if self.scale < 2.0 {
+            return None;
+        }
+        Some(Frame { local: self.local.clone(), scale: self.scale / 2.0 })
+    }
+}
+
+#[wasm_bindgen(js_class = "Frame")]
+impl Frame<JsValue> {
+    #[wasm_bindgen(typescript_type_params = "Q", unchecked_return_type = "Frame<Q>")]
+    pub fn map(
+        &self,
+        #[wasm_bindgen(unchecked_param_type = "(p: P) => Q")] f: &js_sys::Function,
+    ) -> Frame<JsValue> {
+        let out = f.call1(&JsValue::NULL, &self.local).unwrap();
+        Frame { local: out, scale: self.scale }
+    }
+}

@@ -1,0 +1,41 @@
+error: `instantiate` requires the struct to have generic type parameters
+ --> ui-tests/instantiate-struct.rs:5:8
+  |
+5 | struct Concrete {
+  |        ^^^^^^^^
+
+error: duplicate instantiation name `Same`
+  --> ui-tests/instantiate-struct.rs:10:58
+   |
+10 | #[wasm_bindgen(instantiate(Dup<f64> as Same, Dup<u32> as Same))]
+   |                                                          ^^^^
+
+error: expected 2 generic argument(s) to substitute `<T, U>`, found 1
+  --> ui-tests/instantiate-struct.rs:16:31
+   |
+16 | #[wasm_bindgen(instantiate(Two<f64> as TwoF64))]
+   |                               ^^^^^
+
+error: only plain type parameters are supported with `instantiate`
+  --> ui-tests/instantiate-struct.rs:24:12
+   |
+24 | struct Arr<const N: usize> {
+   |            ^^^^^^^^^^^^^^
+
+error: `js_name` cannot be combined with `instantiate`; each instantiation already declares its JS name
+  --> ui-tests/instantiate-struct.rs:30:8
+   |
+30 | struct Named<T> {
+   |        ^^^^^
+
+error: instantiation must be of `Wrong`, found `Other`
+  --> ui-tests/instantiate-struct.rs:35:28
+   |
+35 | #[wasm_bindgen(instantiate(Other<f64> as WrongF64))]
+   |                            ^^^^^
+
+error: instantiation cannot use the JS keyword `class` as its name
+  --> ui-tests/instantiate-struct.rs:41:44
+   |
+41 | #[wasm_bindgen(instantiate(Keyword<f64> as class))]
+   |                                            ^^^^^

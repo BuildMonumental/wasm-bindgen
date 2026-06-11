@@ -43,6 +43,7 @@ pub mod import_class;
 pub mod imports;
 pub mod inheritance;
 pub mod inner_self;
+pub mod instantiate;
 pub mod intrinsics;
 pub mod js_keywords;
 pub mod js_namespace_exports;

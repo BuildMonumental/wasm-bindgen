@@ -218,7 +218,11 @@ impl TryToTokens for ast::LinkToModule {
 
 impl ToTokens for ast::Struct {
     fn to_tokens(&self, tokens: &mut TokenStream) {
-        let name = &self.rust_name;
+        let rust_ident = &self.rust_name;
+        let rust_generics = &self.rust_generics;
+        // The full (possibly monomorphized) type, e.g. `Foo` or `Tr::<f64>`.
+        // Turbofish syntax is valid in both type and expression position.
+        let name = quote! { #rust_ident #rust_generics };
         let name_str = self.qualified_name.to_string();
         let name_len = name_str.len() as u32;
         let name_chars: Vec<u32> = name_str.chars().map(|c| c as u32).collect();
@@ -548,7 +552,9 @@ impl ToTokens for ast::StructField {
         }
 
         let rust_name = &self.rust_name;
-        let struct_name = &self.struct_name;
+        let struct_ident = &self.struct_name;
+        let struct_generics = &self.struct_generics;
+        let struct_name = quote! { #struct_ident #struct_generics };
         let ty = &self.ty;
         let getter = &self.getter;
         let setter = &self.setter;

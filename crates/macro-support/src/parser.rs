@@ -681,6 +681,7 @@ impl ConvertToAst<&ast::Program> for &mut syn::ItemStruct {
                 rust_name: member,
                 js_name: js_field_name,
                 struct_name: self.ident.clone(),
+                struct_generics: None,
                 readonly: field_attrs.readonly().is_some(),
                 ty: field.ty.clone(),
                 getter: Ident::new(&getter, Span::call_site()),
@@ -721,6 +722,7 @@ impl ConvertToAst<&ast::Program> for &mut syn::ItemStruct {
         attrs.check_used();
         Ok(ast::Struct {
             rust_name: self.ident.clone(),
+            rust_generics: None,
             js_name,
             qualified_name,
             fields,

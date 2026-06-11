@@ -1,5 +1,6 @@
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::str::Chars;
 use std::{char, iter};
 
@@ -118,6 +119,7 @@ macro_rules! attrgen {
             (slice_to_array, false, SliceToArray(Span)),
             (typescript_type, false, TypeScriptType(Span, String, Span)),
             (getter_with_clone, false, GetterWithClone(Span)),
+            (instantiate, false, Instantiate(Span, Vec<Instantiation>)),
             (static_string, false, StaticString(Span)),
             (thread_local, false, ThreadLocal(Span)),
             (thread_local_v2, false, ThreadLocalV2(Span)),
@@ -425,6 +427,21 @@ impl Parse for BindgenAttr {
                 return Ok(BindgenAttr::$variant(attr_span, input.parse()?));
             });
 
+            (@parser $variant:ident(Span, Vec<Instantiation>)) => ({
+                let content;
+                syn::parenthesized!(content in input);
+                let insts = content
+                    .parse_terminated(Instantiation::parse, Token![,])?;
+                if insts.is_empty() {
+                    return Err(syn::Error::new(
+                        attr_span,
+                        "expected at least one instantiation, e.g. \
+                         `instantiate(Foo<f64> as FooF64)`",
+                    ));
+                }
+                return Ok(BindgenAttr::$variant(attr_span, insts.into_iter().collect()));
+            });
+
             (@parser $variant:ident(Span, String, Span)) => ({
                 input.parse::<Token![=]>()?;
                 let (val, span) = match input.parse::<syn::LitStr>() {
@@ -534,6 +551,192 @@ impl Parse for AnyIdent {
     }
 }
 
+/// One requested monomorphization of a generic exported struct, written as
+/// `instantiate(Tr<f64> as TrF64)`: the concrete type to stamp out and the
+/// JS class name it is exported under.
+#[cfg_attr(feature = "extra-traits", derive(Debug))]
+#[derive(Clone)]
+pub struct Instantiation {
+    pub(crate) ty: syn::TypePath,
+    pub(crate) js_name: Ident,
+}
+
+impl Parse for Instantiation {
+    fn parse(input: ParseStream) -> SynResult<Self> {
+        let ty: syn::TypePath = input.parse()?;
+        input.parse::<Token![as]>()?;
+        let js_name = input.parse::<AnyIdent>()?.0;
+        Ok(Instantiation { ty, js_name })
+    }
+}
+
+/// A validated monomorphization target derived from an [`Instantiation`]:
+/// the JS class name, the concrete generic arguments in turbofish form, and
+/// the substitution map from generic parameter (plus `Self`) to concrete type.
+pub(crate) struct InstantiationTarget {
+    pub(crate) js_name: String,
+    pub(crate) args: syn::AngleBracketedGenericArguments,
+    renames: Vec<(Ident, syn::Type)>,
+}
+
+impl InstantiationTarget {
+    pub(crate) fn substitute(&self, ty: syn::Type) -> Result<syn::Type, Diagnostic> {
+        let map: BTreeMap<&Ident, Option<Cow<syn::Type>>> = self
+            .renames
+            .iter()
+            .map(|(ident, concrete)| (ident, Some(Cow::Borrowed(concrete))))
+            .collect();
+        crate::generics::generic_to_concrete(ty, &map, &[])
+    }
+}
+
+/// Validates that `generics` contains only plain type parameters and returns
+/// their identifiers. Lifetimes and const parameters cannot be monomorphized
+/// through `instantiate`.
+fn simple_type_params(generics: &syn::Generics) -> Result<Vec<&Ident>, Diagnostic> {
+    for param in &generics.params {
+        if !matches!(param, syn::GenericParam::Type(_)) {
+            bail_span!(
+                param,
+                "only plain type parameters are supported with `instantiate`"
+            );
+        }
+    }
+    Ok(generics.type_params().map(|tp| &tp.ident).collect())
+}
+
+/// Validates a single `instantiate(Base<..> as JsName)` entry against the
+/// generic parameters it must substitute (in argument order) and builds the
+/// corresponding [`InstantiationTarget`].
+pub(crate) fn instantiation_target(
+    inst: &Instantiation,
+    base_ident: &Ident,
+    params: &[&Ident],
+) -> Result<InstantiationTarget, Diagnostic> {
+    let path = &inst.ty.path;
+    if inst.ty.qself.is_some() || path.segments.len() != 1 {
+        bail_span!(
+            inst.ty,
+            "instantiations must name the type directly, e.g. `{}<...>`",
+            base_ident
+        );
+    }
+    let segment = path.segments.last().unwrap();
+    if segment.ident != *base_ident {
+        bail_span!(
+            segment.ident,
+            "instantiation must be of `{}`, found `{}`",
+            base_ident,
+            segment.ident
+        );
+    }
+    let args = match &segment.arguments {
+        syn::PathArguments::AngleBracketed(args) => args,
+        _ => bail_span!(
+            segment,
+            "instantiation must supply concrete generic arguments, e.g. `{}<f64>`",
+            base_ident
+        ),
+    };
+    let tys = args
+        .args
+        .iter()
+        .map(|arg| match arg {
+            syn::GenericArgument::Type(ty) => Ok(ty),
+            other => Err(Diagnostic::span_error(
+                other.span(),
+                "only type arguments are supported in instantiations",
+            )),
+        })
+        .collect::<Result<Vec<_>, Diagnostic>>()?;
+    if tys.len() != params.len() {
+        bail_span!(
+            args,
+            "expected {} generic argument(s) to substitute `<{}>`, found {}",
+            params.len(),
+            params
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            tys.len()
+        );
+    }
+    let js_name = inst.js_name.unraw().to_string();
+    if is_js_keyword(&js_name) && js_name != "default" {
+        bail_span!(
+            inst.js_name,
+            "instantiation cannot use the JS keyword `{}` as its name",
+            js_name
+        );
+    }
+    let mut turbofish = args.clone();
+    turbofish.colon2_token = Some(Default::default());
+
+    let self_ty: syn::Type = syn::Type::Path(inst.ty.clone());
+    let renames = params
+        .iter()
+        .zip(tys.iter())
+        .map(|(param, ty)| ((*param).clone(), (*ty).clone()))
+        .chain(iter::once((Ident::new("Self", Span::call_site()), self_ty)))
+        .collect();
+
+    Ok(InstantiationTarget {
+        js_name,
+        args: turbofish,
+        renames,
+    })
+}
+
+/// Validates the full `instantiate` list for a generic struct or impl block.
+/// Returns `None` when the item is not generic (and no `instantiate` was
+/// given) — the ordinary single-export path.
+fn instantiation_targets(
+    generics: &syn::Generics,
+    attrs: &BindgenAttrs,
+    base_ident: &Ident,
+    item_kind: &str,
+) -> Result<Option<Vec<InstantiationTarget>>, Diagnostic> {
+    let insts = attrs.instantiate();
+    if generics.params.is_empty() {
+        if insts.is_some() {
+            bail_span!(
+                base_ident,
+                "`instantiate` requires the {} to have generic type parameters",
+                item_kind
+            );
+        }
+        return Ok(None);
+    }
+    let insts = match insts {
+        Some(insts) => insts,
+        None => bail_span!(
+            generics,
+            "{}s with #[wasm_bindgen] cannot have lifetime or type parameters \
+             unless explicit instantiations are listed, e.g. \
+             `#[wasm_bindgen(instantiate({}<f64> as {}F64))]`",
+            item_kind,
+            base_ident,
+            base_ident
+        ),
+    };
+    let params = simple_type_params(generics)?;
+    let targets = insts
+        .iter()
+        .map(|inst| instantiation_target(inst, base_ident, &params))
+        .collect::<Result<Vec<_>, Diagnostic>>()?;
+    for (i, target) in targets.iter().enumerate() {
+        if targets[..i].iter().any(|t| t.js_name == target.js_name) {
+            bail_span!(
+                insts[i].js_name,
+                "duplicate instantiation name `{}`",
+                target.js_name
+            );
+        }
+    }
+    Ok(Some(targets))
+}
+
 /// Conversion trait with context.
 ///
 /// Used to convert syn tokens into an AST, that we can then use to generate glue code. The context
@@ -548,17 +751,11 @@ pub(crate) trait ConvertToAst<Ctx> {
 }
 
 impl ConvertToAst<&ast::Program> for &mut syn::ItemStruct {
-    type Target = ast::Struct;
+    type Target = Vec<ast::Struct>;
 
     fn convert(self, program: &ast::Program) -> Result<Self::Target, Diagnostic> {
-        if !self.generics.params.is_empty() {
-            bail_span!(
-                self.generics,
-                "structs with #[wasm_bindgen] cannot have lifetime or \
-                 type parameters currently"
-            );
-        }
         let attrs = BindgenAttrs::find(&mut self.attrs)?;
+        let instantiations = instantiation_targets(&self.generics, &attrs, &self.ident, "struct")?;
 
         // the `wasm_bindgen` option has been used before
         let _ = attrs.wasm_bindgen();
@@ -623,12 +820,26 @@ impl ConvertToAst<&ast::Program> for &mut syn::ItemStruct {
             ));
         }
 
-        let mut fields = Vec::new();
-        let js_name = attrs
+        let explicit_js_name = attrs
             .js_name_no_symbol("structs with #[wasm_bindgen]")?
-            .map(|s| s.to_string())
-            .unwrap_or(self.ident.unraw().to_string());
-        if is_js_keyword(&js_name) && js_name != "default" {
+            .map(|s| s.to_string());
+        if instantiations.is_some() {
+            if explicit_js_name.is_some() {
+                bail_span!(
+                    self.ident,
+                    "`js_name` cannot be combined with `instantiate`; each \
+                     instantiation already declares its JS name"
+                );
+            }
+            if extends.is_some() {
+                bail_span!(
+                    self.ident,
+                    "`extends` is not supported on generic structs with `instantiate`"
+                );
+            }
+        }
+        let js_name = explicit_js_name.unwrap_or(self.ident.unraw().to_string());
+        if instantiations.is_none() && is_js_keyword(&js_name) && js_name != "default" {
             bail_span!(
                 self.ident,
                 "struct cannot use the JS keyword `{}` as its name",
@@ -639,7 +850,18 @@ impl ConvertToAst<&ast::Program> for &mut syn::ItemStruct {
         let is_inspectable = attrs.inspectable().is_some();
         let getter_with_clone = attrs.getter_with_clone();
         let js_namespace = attrs.js_namespace().map(|(ns, _)| ns.0);
-        let qualified_name = wasm_bindgen_shared::qualified_name(js_namespace.as_deref(), &js_name);
+        struct RawStructField {
+            member: syn::Member,
+            js_name: String,
+            ty: syn::Type,
+            readonly: bool,
+            comments: Vec<String>,
+            generate_typescript: bool,
+            generate_jsdoc: bool,
+            getter_with_clone: Option<Span>,
+            is_parent: bool,
+        }
+        let mut raw_fields = Vec::new();
         let mut parent_count = 0usize;
         for (i, field) in self.fields.iter_mut().enumerate() {
             let field_attrs = BindgenAttrs::find(&mut field.attrs)?;
@@ -674,18 +896,12 @@ impl ConvertToAst<&ast::Program> for &mut syn::ItemStruct {
             };
 
             let comments = extract_doc_comments(&field.attrs);
-            let getter = wasm_bindgen_shared::struct_field_get(&qualified_name, &js_field_name);
-            let setter = wasm_bindgen_shared::struct_field_set(&qualified_name, &js_field_name);
 
-            fields.push(ast::StructField {
-                rust_name: member,
+            raw_fields.push(RawStructField {
+                member,
                 js_name: js_field_name,
-                struct_name: self.ident.clone(),
-                struct_generics: None,
-                readonly: field_attrs.readonly().is_some(),
                 ty: field.ty.clone(),
-                getter: Ident::new(&getter, Span::call_site()),
-                setter: Ident::new(&setter, Span::call_site()),
+                readonly: field_attrs.readonly().is_some(),
                 comments,
                 generate_typescript: field_attrs.skip_typescript().is_none(),
                 generate_jsdoc: field_attrs.skip_jsdoc().is_none(),
@@ -694,7 +910,6 @@ impl ConvertToAst<&ast::Program> for &mut syn::ItemStruct {
                     .or(getter_with_clone)
                     .copied(),
                 is_parent,
-                wasm_bindgen: program.wasm_bindgen.clone(),
             });
             field_attrs.check_used();
         }
@@ -720,22 +935,66 @@ impl ConvertToAst<&ast::Program> for &mut syn::ItemStruct {
         let private = attrs.private().is_some();
         let comments: Vec<String> = extract_doc_comments(&self.attrs);
         attrs.check_used();
-        Ok(ast::Struct {
-            rust_name: self.ident.clone(),
-            rust_generics: None,
-            js_name,
-            qualified_name,
-            fields,
-            comments,
-            is_inspectable,
-            generate_typescript,
-            private,
-            js_namespace,
-            extends,
-            extends_js_class,
-            extends_js_namespace,
-            wasm_bindgen: program.wasm_bindgen.clone(),
-        })
+
+        let build_struct = |js_name: String,
+                            target: Option<&InstantiationTarget>|
+         -> Result<ast::Struct, Diagnostic> {
+            let qualified_name =
+                wasm_bindgen_shared::qualified_name(js_namespace.as_deref(), &js_name);
+            let fields = raw_fields
+                .iter()
+                .map(|field| {
+                    let ty = match target {
+                        Some(target) => target.substitute(field.ty.clone())?,
+                        None => field.ty.clone(),
+                    };
+                    let getter =
+                        wasm_bindgen_shared::struct_field_get(&qualified_name, &field.js_name);
+                    let setter =
+                        wasm_bindgen_shared::struct_field_set(&qualified_name, &field.js_name);
+                    Ok(ast::StructField {
+                        rust_name: field.member.clone(),
+                        js_name: field.js_name.clone(),
+                        struct_name: self.ident.clone(),
+                        struct_generics: target.map(|t| t.args.clone()),
+                        readonly: field.readonly,
+                        ty,
+                        getter: Ident::new(&getter, Span::call_site()),
+                        setter: Ident::new(&setter, Span::call_site()),
+                        comments: field.comments.clone(),
+                        generate_typescript: field.generate_typescript,
+                        generate_jsdoc: field.generate_jsdoc,
+                        getter_with_clone: field.getter_with_clone,
+                        is_parent: field.is_parent,
+                        wasm_bindgen: program.wasm_bindgen.clone(),
+                    })
+                })
+                .collect::<Result<Vec<_>, Diagnostic>>()?;
+            Ok(ast::Struct {
+                rust_name: self.ident.clone(),
+                rust_generics: target.map(|t| t.args.clone()),
+                js_name,
+                qualified_name,
+                fields,
+                comments: comments.clone(),
+                is_inspectable,
+                generate_typescript,
+                private,
+                js_namespace: js_namespace.clone(),
+                extends: extends.clone(),
+                extends_js_class: extends_js_class.clone(),
+                extends_js_namespace: extends_js_namespace.clone(),
+                wasm_bindgen: program.wasm_bindgen.clone(),
+            })
+        };
+
+        match &instantiations {
+            None => Ok(vec![build_struct(js_name, None)?]),
+            Some(targets) => targets
+                .iter()
+                .map(|target| build_struct(target.js_name.clone(), Some(target)))
+                .collect(),
+        }
     }
 }
 

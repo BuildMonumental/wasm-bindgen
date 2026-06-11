@@ -10,7 +10,7 @@ error: can only #[wasm_bindgen] non-const functions
 7 | pub const fn foo2() {}
   |     ^^^^^
 
-error: structs with #[wasm_bindgen] cannot have lifetime or type parameters currently
+error: structs with #[wasm_bindgen] cannot have lifetime or type parameters unless explicit instantiations are listed, e.g. `#[wasm_bindgen(instantiate(Foo<f64> as FooF64))]`
   --> ui-tests/invalid-items.rs:10:11
    |
 10 | struct Foo<T>(T);

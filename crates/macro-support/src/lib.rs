@@ -228,7 +228,8 @@ pub fn expand_struct_marker(item: TokenStream) -> Result<TokenStream, Diagnostic
     let mut s: syn::ItemStruct = syn::parse2(item)?;
 
     let mut program = ast::Program::default();
-    program.structs.push((&mut s).convert(&program)?);
+    let structs = (&mut s).convert(&program)?;
+    program.structs.extend(structs);
 
     let mut tokens = proc_macro2::TokenStream::new();
     program.try_to_tokens(&mut tokens)?;

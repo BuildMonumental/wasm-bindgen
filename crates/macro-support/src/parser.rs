@@ -1,5 +1,6 @@
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::str::Chars;
 use std::{char, iter};
 
@@ -118,6 +119,8 @@ macro_rules! attrgen {
             (slice_to_array, false, SliceToArray(Span)),
             (typescript_type, false, TypeScriptType(Span, String, Span)),
             (getter_with_clone, false, GetterWithClone(Span)),
+            (instantiate, false, Instantiate(Span, Vec<Instantiation>)),
+            (typescript_type_params, false, TsTypeParams(Span, String, Span)),
             (static_string, false, StaticString(Span)),
             (thread_local, false, ThreadLocal(Span)),
             (thread_local_v2, false, ThreadLocalV2(Span)),
@@ -425,6 +428,21 @@ impl Parse for BindgenAttr {
                 return Ok(BindgenAttr::$variant(attr_span, input.parse()?));
             });
 
+            (@parser $variant:ident(Span, Vec<Instantiation>)) => ({
+                let content;
+                syn::parenthesized!(content in input);
+                let insts = content
+                    .parse_terminated(Instantiation::parse, Token![,])?;
+                if insts.is_empty() {
+                    return Err(syn::Error::new(
+                        attr_span,
+                        "expected at least one instantiation, e.g. \
+                         `instantiate(Foo<f64> as FooF64)`",
+                    ));
+                }
+                return Ok(BindgenAttr::$variant(attr_span, insts.into_iter().collect()));
+            });
+
             (@parser $variant:ident(Span, String, Span)) => ({
                 input.parse::<Token![=]>()?;
                 let (val, span) = match input.parse::<syn::LitStr>() {
@@ -534,6 +552,262 @@ impl Parse for AnyIdent {
     }
 }
 
+/// One requested monomorphization of a generic exported struct, written as
+/// `instantiate(Tr<f64> as TrF64)`: the concrete type to stamp out and the
+/// JS class name it is exported under.
+#[cfg_attr(feature = "extra-traits", derive(Debug))]
+#[derive(Clone)]
+pub struct Instantiation {
+    pub(crate) ty: syn::TypePath,
+    pub(crate) js_name: Ident,
+    /// TypeScript-level type parameters on the exported class, from the
+    /// `as Tr<P>` form. The runtime class stays erased; the generated
+    /// `.d.ts` declares `class Tr<P = any>` and method positions whose
+    /// original type was the corresponding Rust parameter are typed `P`.
+    pub(crate) ts_params: Vec<Ident>,
+}
+
+impl Parse for Instantiation {
+    fn parse(input: ParseStream) -> SynResult<Self> {
+        let ty: syn::TypePath = input.parse()?;
+        input.parse::<Token![as]>()?;
+        let js_name = input.parse::<AnyIdent>()?.0;
+        let mut ts_params = Vec::new();
+        if input.peek(Token![<]) {
+            input.parse::<Token![<]>()?;
+            loop {
+                ts_params.push(input.parse::<AnyIdent>()?.0);
+                if input.parse::<Option<Token![,]>>()?.is_none() {
+                    break;
+                }
+            }
+            input.parse::<Token![>]>()?;
+        }
+        Ok(Instantiation { ty, js_name, ts_params })
+    }
+}
+
+/// A validated monomorphization target derived from an [`Instantiation`]:
+/// the JS class name, the concrete generic arguments in turbofish form, and
+/// the substitution map from generic parameter (plus `Self`) to concrete type.
+pub(crate) struct InstantiationTarget {
+    pub(crate) js_name: String,
+    pub(crate) args: syn::AngleBracketedGenericArguments,
+    renames: Vec<(Ident, syn::Type)>,
+    /// Pairs of (Rust generic parameter, TS type parameter name) for
+    /// TS-generic instantiations (`as Tr<P>`); empty otherwise.
+    pub(crate) ts_params: Vec<(Ident, String)>,
+}
+
+impl InstantiationTarget {
+    pub(crate) fn substitute(&self, ty: syn::Type) -> Result<syn::Type, Diagnostic> {
+        let map: BTreeMap<&Ident, Option<Cow<syn::Type>>> = self
+            .renames
+            .iter()
+            .map(|(ident, concrete)| (ident, Some(Cow::Borrowed(concrete))))
+            .collect();
+        crate::generics::generic_to_concrete(ty, &map, &[])
+    }
+}
+
+/// Builds the target for a concrete impl block (`impl Foo<Evaluated>` with
+/// `js_class = "FooDebug"`): no generic parameters to substitute, only `Self`
+/// rewritten to the concrete type, with the self type's generic arguments
+/// carried through for shim generation.
+pub(crate) fn concrete_impl_target(
+    concrete: &syn::TypePath,
+    js_class: &str,
+) -> Result<InstantiationTarget, Diagnostic> {
+    let segment = concrete.path.segments.last().unwrap();
+    let args = match &segment.arguments {
+        syn::PathArguments::AngleBracketed(args) => args,
+        _ => bail_span!(
+            segment,
+            "internal error: concrete impl target without generic arguments"
+        ),
+    };
+    let mut turbofish = args.clone();
+    turbofish.colon2_token = Some(Default::default());
+    Ok(InstantiationTarget {
+        js_name: js_class.to_string(),
+        args: turbofish,
+        renames: vec![(
+            Ident::new("Self", Span::call_site()),
+            syn::Type::Path(concrete.clone()),
+        )],
+        ts_params: Vec::new(),
+    })
+}
+
+/// Validates that `generics` contains only plain type parameters and returns
+/// their identifiers. Lifetimes and const parameters cannot be monomorphized
+/// through `instantiate`.
+fn simple_type_params(generics: &syn::Generics) -> Result<Vec<&Ident>, Diagnostic> {
+    for param in &generics.params {
+        if !matches!(param, syn::GenericParam::Type(_)) {
+            bail_span!(
+                param,
+                "only plain type parameters are supported with `instantiate`"
+            );
+        }
+    }
+    Ok(generics.type_params().map(|tp| &tp.ident).collect())
+}
+
+/// Validates a single `instantiate(Base<..> as JsName)` entry against the
+/// generic parameters it must substitute (in argument order) and builds the
+/// corresponding [`InstantiationTarget`].
+pub(crate) fn instantiation_target(
+    inst: &Instantiation,
+    base_ident: &Ident,
+    params: &[&Ident],
+) -> Result<InstantiationTarget, Diagnostic> {
+    let path = &inst.ty.path;
+    if inst.ty.qself.is_some() || path.segments.len() != 1 {
+        bail_span!(
+            inst.ty,
+            "instantiations must name the type directly, e.g. `{}<...>`",
+            base_ident
+        );
+    }
+    let segment = path.segments.last().unwrap();
+    if segment.ident != *base_ident {
+        bail_span!(
+            segment.ident,
+            "instantiation must be of `{}`, found `{}`",
+            base_ident,
+            segment.ident
+        );
+    }
+    let args = match &segment.arguments {
+        syn::PathArguments::AngleBracketed(args) => args,
+        _ => bail_span!(
+            segment,
+            "instantiation must supply concrete generic arguments, e.g. `{}<f64>`",
+            base_ident
+        ),
+    };
+    let tys = args
+        .args
+        .iter()
+        .map(|arg| match arg {
+            syn::GenericArgument::Type(ty) => Ok(ty),
+            other => Err(Diagnostic::span_error(
+                other.span(),
+                "only type arguments are supported in instantiations",
+            )),
+        })
+        .collect::<Result<Vec<_>, Diagnostic>>()?;
+    if tys.len() != params.len() {
+        bail_span!(
+            args,
+            "expected {} generic argument(s) to substitute `<{}>`, found {}",
+            params.len(),
+            params
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            tys.len()
+        );
+    }
+    let js_name = inst.js_name.unraw().to_string();
+    if is_js_keyword(&js_name) && js_name != "default" {
+        bail_span!(
+            inst.js_name,
+            "instantiation cannot use the JS keyword `{}` as its name",
+            js_name
+        );
+    }
+    if !inst.ts_params.is_empty() && inst.ts_params.len() != params.len() {
+        bail_span!(
+            inst.js_name,
+            "expected {} TypeScript type parameter(s) to mirror `<{}>` positionally, found {}",
+            params.len(),
+            params
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            inst.ts_params.len()
+        );
+    }
+    let mut turbofish = args.clone();
+    turbofish.colon2_token = Some(Default::default());
+
+    let self_ty: syn::Type = syn::Type::Path(inst.ty.clone());
+    let renames = params
+        .iter()
+        .zip(tys.iter())
+        .map(|(param, ty)| ((*param).clone(), (*ty).clone()))
+        .chain(iter::once((
+            Ident::new("Self", Span::call_site()),
+            self_ty,
+        )))
+        .collect();
+    let ts_params = params
+        .iter()
+        .zip(inst.ts_params.iter())
+        .map(|(param, ts)| ((*param).clone(), ts.unraw().to_string()))
+        .collect();
+
+    Ok(InstantiationTarget {
+        js_name,
+        args: turbofish,
+        renames,
+        ts_params,
+    })
+}
+
+/// Validates the full `instantiate` list for a generic struct or impl block.
+/// Returns `None` when the item is not generic (and no `instantiate` was
+/// given) — the ordinary single-export path.
+fn instantiation_targets(
+    generics: &syn::Generics,
+    attrs: &BindgenAttrs,
+    base_ident: &Ident,
+    item_kind: &str,
+) -> Result<Option<Vec<InstantiationTarget>>, Diagnostic> {
+    let insts = attrs.instantiate();
+    if generics.params.is_empty() {
+        if insts.is_some() {
+            bail_span!(
+                base_ident,
+                "`instantiate` requires the {} to have generic type parameters",
+                item_kind
+            );
+        }
+        return Ok(None);
+    }
+    let insts = match insts {
+        Some(insts) => insts,
+        None => bail_span!(
+            generics,
+            "{}s with #[wasm_bindgen] cannot have lifetime or type parameters \
+             unless explicit instantiations are listed, e.g. \
+             `#[wasm_bindgen(instantiate({}<f64> as {}F64))]`",
+            item_kind,
+            base_ident,
+            base_ident
+        ),
+    };
+    let params = simple_type_params(generics)?;
+    let targets = insts
+        .iter()
+        .map(|inst| instantiation_target(inst, base_ident, &params))
+        .collect::<Result<Vec<_>, Diagnostic>>()?;
+    for (i, target) in targets.iter().enumerate() {
+        if targets[..i].iter().any(|t| t.js_name == target.js_name) {
+            bail_span!(
+                insts[i].js_name,
+                "duplicate instantiation name `{}`",
+                target.js_name
+            );
+        }
+    }
+    Ok(Some(targets))
+}
+
 /// Conversion trait with context.
 ///
 /// Used to convert syn tokens into an AST, that we can then use to generate glue code. The context
@@ -548,17 +822,12 @@ pub(crate) trait ConvertToAst<Ctx> {
 }
 
 impl ConvertToAst<&ast::Program> for &mut syn::ItemStruct {
-    type Target = ast::Struct;
+    type Target = Vec<ast::Struct>;
 
     fn convert(self, program: &ast::Program) -> Result<Self::Target, Diagnostic> {
-        if !self.generics.params.is_empty() {
-            bail_span!(
-                self.generics,
-                "structs with #[wasm_bindgen] cannot have lifetime or \
-                 type parameters currently"
-            );
-        }
         let attrs = BindgenAttrs::find(&mut self.attrs)?;
+        let instantiations =
+            instantiation_targets(&self.generics, &attrs, &self.ident, "struct")?;
 
         // the `wasm_bindgen` option has been used before
         let _ = attrs.wasm_bindgen();
@@ -623,12 +892,26 @@ impl ConvertToAst<&ast::Program> for &mut syn::ItemStruct {
             ));
         }
 
-        let mut fields = Vec::new();
-        let js_name = attrs
+        let explicit_js_name = attrs
             .js_name_no_symbol("structs with #[wasm_bindgen]")?
-            .map(|s| s.to_string())
-            .unwrap_or(self.ident.unraw().to_string());
-        if is_js_keyword(&js_name) && js_name != "default" {
+            .map(|s| s.to_string());
+        if instantiations.is_some() {
+            if explicit_js_name.is_some() {
+                bail_span!(
+                    self.ident,
+                    "`js_name` cannot be combined with `instantiate`; each \
+                     instantiation already declares its JS name"
+                );
+            }
+            if extends.is_some() {
+                bail_span!(
+                    self.ident,
+                    "`extends` is not supported on generic structs with `instantiate`"
+                );
+            }
+        }
+        let js_name = explicit_js_name.unwrap_or(self.ident.unraw().to_string());
+        if instantiations.is_none() && is_js_keyword(&js_name) && js_name != "default" {
             bail_span!(
                 self.ident,
                 "struct cannot use the JS keyword `{}` as its name",
@@ -639,7 +922,18 @@ impl ConvertToAst<&ast::Program> for &mut syn::ItemStruct {
         let is_inspectable = attrs.inspectable().is_some();
         let getter_with_clone = attrs.getter_with_clone();
         let js_namespace = attrs.js_namespace().map(|(ns, _)| ns.0);
-        let qualified_name = wasm_bindgen_shared::qualified_name(js_namespace.as_deref(), &js_name);
+        struct RawStructField {
+            member: syn::Member,
+            js_name: String,
+            ty: syn::Type,
+            readonly: bool,
+            comments: Vec<String>,
+            generate_typescript: bool,
+            generate_jsdoc: bool,
+            getter_with_clone: Option<Span>,
+            is_parent: bool,
+        }
+        let mut raw_fields = Vec::new();
         let mut parent_count = 0usize;
         for (i, field) in self.fields.iter_mut().enumerate() {
             let field_attrs = BindgenAttrs::find(&mut field.attrs)?;
@@ -674,17 +968,12 @@ impl ConvertToAst<&ast::Program> for &mut syn::ItemStruct {
             };
 
             let comments = extract_doc_comments(&field.attrs);
-            let getter = wasm_bindgen_shared::struct_field_get(&qualified_name, &js_field_name);
-            let setter = wasm_bindgen_shared::struct_field_set(&qualified_name, &js_field_name);
 
-            fields.push(ast::StructField {
-                rust_name: member,
+            raw_fields.push(RawStructField {
+                member,
                 js_name: js_field_name,
-                struct_name: self.ident.clone(),
-                readonly: field_attrs.readonly().is_some(),
                 ty: field.ty.clone(),
-                getter: Ident::new(&getter, Span::call_site()),
-                setter: Ident::new(&setter, Span::call_site()),
+                readonly: field_attrs.readonly().is_some(),
                 comments,
                 generate_typescript: field_attrs.skip_typescript().is_none(),
                 generate_jsdoc: field_attrs.skip_jsdoc().is_none(),
@@ -693,7 +982,6 @@ impl ConvertToAst<&ast::Program> for &mut syn::ItemStruct {
                     .or(getter_with_clone)
                     .copied(),
                 is_parent,
-                wasm_bindgen: program.wasm_bindgen.clone(),
             });
             field_attrs.check_used();
         }
@@ -719,21 +1007,68 @@ impl ConvertToAst<&ast::Program> for &mut syn::ItemStruct {
         let private = attrs.private().is_some();
         let comments: Vec<String> = extract_doc_comments(&self.attrs);
         attrs.check_used();
-        Ok(ast::Struct {
-            rust_name: self.ident.clone(),
-            js_name,
-            qualified_name,
-            fields,
-            comments,
-            is_inspectable,
-            generate_typescript,
-            private,
-            js_namespace,
-            extends,
-            extends_js_class,
-            extends_js_namespace,
-            wasm_bindgen: program.wasm_bindgen.clone(),
-        })
+
+        let build_struct =
+            |js_name: String, target: Option<&InstantiationTarget>| -> Result<ast::Struct, Diagnostic> {
+                let qualified_name =
+                    wasm_bindgen_shared::qualified_name(js_namespace.as_deref(), &js_name);
+                let fields = raw_fields
+                    .iter()
+                    .map(|field| {
+                        let ty = match target {
+                            Some(target) => target.substitute(field.ty.clone())?,
+                            None => field.ty.clone(),
+                        };
+                        let getter =
+                            wasm_bindgen_shared::struct_field_get(&qualified_name, &field.js_name);
+                        let setter =
+                            wasm_bindgen_shared::struct_field_set(&qualified_name, &field.js_name);
+                        Ok(ast::StructField {
+                            rust_name: field.member.clone(),
+                            js_name: field.js_name.clone(),
+                            struct_name: self.ident.clone(),
+                            struct_generics: target.map(|t| t.args.clone()),
+                            readonly: field.readonly,
+                            ty,
+                            getter: Ident::new(&getter, Span::call_site()),
+                            setter: Ident::new(&setter, Span::call_site()),
+                            comments: field.comments.clone(),
+                            generate_typescript: field.generate_typescript,
+                            generate_jsdoc: field.generate_jsdoc,
+                            getter_with_clone: field.getter_with_clone,
+                            is_parent: field.is_parent,
+                            wasm_bindgen: program.wasm_bindgen.clone(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, Diagnostic>>()?;
+                Ok(ast::Struct {
+                    rust_name: self.ident.clone(),
+                    rust_generics: target.map(|t| t.args.clone()),
+                    ts_params: target
+                        .map(|t| t.ts_params.iter().map(|(_, ts)| ts.clone()).collect())
+                        .unwrap_or_default(),
+                    js_name,
+                    qualified_name,
+                    fields,
+                    comments: comments.clone(),
+                    is_inspectable,
+                    generate_typescript,
+                    private,
+                    js_namespace: js_namespace.clone(),
+                    extends: extends.clone(),
+                    extends_js_class: extends_js_class.clone(),
+                    extends_js_namespace: extends_js_namespace.clone(),
+                    wasm_bindgen: program.wasm_bindgen.clone(),
+                })
+            };
+
+        match &instantiations {
+            None => Ok(vec![build_struct(js_name, None)?]),
+            Some(targets) => targets
+                .iter()
+                .map(|target| build_struct(target.js_name.clone(), Some(target)))
+                .collect(),
+        }
     }
 }
 
@@ -1569,6 +1904,7 @@ fn function_from_decl(
             generate_typescript: opts.skip_typescript().is_none(),
             generate_jsdoc: opts.skip_jsdoc().is_none(),
             variadic: opts.variadic().is_some(),
+            ts_params: opts.typescript_type_params().map(|(s, _)| s.to_string()),
             ret,
             arguments: arguments
                 .into_iter()
@@ -1806,6 +2142,7 @@ impl<'a> MacroParse<(Option<BindgenAttrs>, &'a mut TokenStream)> for syn::Item {
                     method_kind,
                     method_self: None,
                     rust_class: None,
+                    rust_class_generics: None,
                     rust_name,
                     start,
                     wasm_bindgen: program.wasm_bindgen.clone(),
@@ -1869,25 +2206,108 @@ impl MacroParse<BindgenAttrs> for &mut syn::ItemImpl {
         if let Some((_, path, _)) = &self.trait_ {
             bail_span!(path, "#[wasm_bindgen] trait impls are not supported");
         }
-        if !self.generics.params.is_empty() {
-            bail_span!(
-                self.generics,
-                "#[wasm_bindgen] generic impls aren't supported"
-            );
-        }
         let name = match get_ty(&self.self_ty) {
             syn::Type::Path(syn::TypePath {
                 qself: None,
                 ref path,
-            }) => path,
+            }) => path.clone(),
             _ => bail_span!(
                 self.self_ty,
                 "unsupported self type in #[wasm_bindgen] impl"
             ),
         };
+
+        // An impl whose self type carries concrete generic arguments (e.g.
+        // `impl Action<Evaluated>`) but has no impl-level type parameters
+        // attaches its methods to one specific instantiation's exported
+        // class. The macro cannot see the struct's `instantiate` list
+        // cross-invocation, so the target JS class must be named explicitly
+        // via `js_class`; a mismatch with the struct's declared instantiation
+        // surfaces as a missing-ABI-impl compile error on the shims.
+        let concrete_self_ty = if self.generics.params.is_empty() {
+            match &name.segments.last().unwrap().arguments {
+                syn::PathArguments::AngleBracketed(_) => {
+                    if opts.instantiate().is_some() {
+                        bail_span!(
+                            &self.self_ty,
+                            "use `js_class = \"...\"` (not `instantiate`) to attach a \
+                             concrete impl to one instantiation's exported class"
+                        );
+                    }
+                    if opts.js_class().is_none() {
+                        bail_span!(
+                            &self.self_ty,
+                            "an impl for a concrete instantiation of a generic struct \
+                             must name the exported class it attaches to, e.g. \
+                             `#[wasm_bindgen(js_class = \"MyClassName\")]` matching the \
+                             struct's `instantiate(... as MyClassName)` entry"
+                        );
+                    }
+                    Some(syn::TypePath {
+                        qself: None,
+                        path: name.clone(),
+                    })
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let generic_params = if self.generics.params.is_empty() {
+            if concrete_self_ty.is_none() && opts.instantiate().is_some() {
+                bail_span!(
+                    &self.self_ty,
+                    "`instantiate` requires the impl block to have generic type parameters"
+                );
+            }
+            None
+        } else {
+            let insts = match opts.instantiate() {
+                Some(insts) => insts,
+                None => bail_span!(
+                    self.generics,
+                    "#[wasm_bindgen] generic impls aren't supported unless explicit \
+                     instantiations are listed, e.g. \
+                     `#[wasm_bindgen(instantiate(Foo<f64> as FooF64))]`"
+                ),
+            };
+            let params = impl_generic_params_in_self_ty_order(&self.generics, &name)?;
+            let base_ident = name.segments.last().unwrap().ident.clone();
+            let param_refs: Vec<&Ident> = params.iter().collect();
+            let mut seen = Vec::new();
+            for inst in insts {
+                let target = instantiation_target(inst, &base_ident, &param_refs)?;
+                if seen.contains(&target.js_name) {
+                    bail_span!(
+                        inst.js_name,
+                        "duplicate instantiation name `{}`",
+                        target.js_name
+                    );
+                }
+                seen.push(target.js_name);
+            }
+            Some((params, insts.clone()))
+        };
+
+        // The class marker carries the *base* path (no generic arguments);
+        // the per-instantiation concrete arguments travel separately through
+        // `generics`/`instantiate` marker parameters.
+        let mut class_path = name.clone();
+        if let Some(last) = class_path.segments.last_mut() {
+            last.arguments = syn::PathArguments::None;
+        }
+
         let mut errors = Vec::new();
         for item in self.items.iter_mut() {
-            if let Err(e) = prepare_for_impl_recursion(item, name, program, &opts) {
+            if let Err(e) = prepare_for_impl_recursion(
+                item,
+                &class_path,
+                program,
+                &opts,
+                generic_params.as_ref(),
+                concrete_self_ty.as_ref(),
+            ) {
                 errors.push(e);
             }
         }
@@ -1895,6 +2315,60 @@ impl MacroParse<BindgenAttrs> for &mut syn::ItemImpl {
         opts.check_used();
         Ok(())
     }
+}
+
+/// For a generic impl block, validates that the impl's generic parameters
+/// are plain type parameters and that the self type's generic arguments are
+/// exactly those parameters (each appearing once, as a bare identifier).
+/// Returns the parameter identifiers in self-type argument order — the order
+/// in which `instantiate` arguments substitute them.
+fn impl_generic_params_in_self_ty_order(
+    generics: &syn::Generics,
+    self_ty_path: &syn::Path,
+) -> Result<Vec<Ident>, Diagnostic> {
+    let params = simple_type_params(generics)?;
+    let last = self_ty_path.segments.last().unwrap();
+    let args = match &last.arguments {
+        syn::PathArguments::AngleBracketed(args) => args,
+        _ => bail_span!(
+            self_ty_path,
+            "a generic impl with `instantiate` must apply the impl's type \
+             parameters to the self type, e.g. `impl<T> Foo<T>`"
+        ),
+    };
+    let mut ordered = Vec::new();
+    for arg in &args.args {
+        let ident = match arg {
+            syn::GenericArgument::Type(syn::Type::Path(type_path))
+                if type_path.qself.is_none() && type_path.path.segments.len() == 1 =>
+            {
+                let segment = &type_path.path.segments[0];
+                if !segment.arguments.is_empty() {
+                    bail_span!(arg, "self type arguments must be bare type parameters");
+                }
+                segment.ident.clone()
+            }
+            _ => bail_span!(arg, "self type arguments must be bare type parameters"),
+        };
+        if !params.contains(&&ident) {
+            bail_span!(
+                ident,
+                "`{}` is not a type parameter of this impl block",
+                ident
+            );
+        }
+        if ordered.contains(&ident) {
+            bail_span!(ident, "type parameter `{}` is used more than once", ident);
+        }
+        ordered.push(ident);
+    }
+    if ordered.len() != params.len() {
+        bail_span!(
+            self_ty_path,
+            "all type parameters of the impl must appear in the self type"
+        );
+    }
+    Ok(ordered)
 }
 
 // Prepare for recursion into an `impl` block. Here we want to attach an
@@ -1910,6 +2384,8 @@ fn prepare_for_impl_recursion(
     class: &syn::Path,
     program: &ast::Program,
     impl_opts: &BindgenAttrs,
+    generic_params: Option<&(Vec<Ident>, Vec<Instantiation>)>,
+    concrete_self_ty: Option<&syn::TypePath>,
 ) -> Result<(), Diagnostic> {
     let method = match item {
         syn::ImplItem::Fn(m) => m,
@@ -1983,6 +2459,24 @@ fn prepare_for_impl_recursion(
         quote::quote! { , js_namespace = [ #(#js_namespace_lits),* ] }
     };
 
+    let generics_tokens = match (generic_params, concrete_self_ty) {
+        (Some((params, insts)), _) => {
+            let inst_tokens = insts.iter().map(|inst| {
+                let ty = &inst.ty;
+                let js_name = &inst.js_name;
+                let ts_params = &inst.ts_params;
+                if ts_params.is_empty() {
+                    quote::quote! { #ty as #js_name }
+                } else {
+                    quote::quote! { #ty as #js_name<#(#ts_params),*> }
+                }
+            });
+            quote::quote! { , generics = [ #(#params),* ], instantiate = [ #(#inst_tokens),* ] }
+        }
+        (None, Some(concrete)) => quote::quote! { , concrete = #concrete },
+        (None, None) => quote::quote! {},
+    };
+
     let wasm_bindgen = &program.wasm_bindgen;
     let wasm_bindgen_futures = &program.wasm_bindgen_futures;
     let js_sys = &program.js_sys;
@@ -1992,7 +2486,7 @@ fn prepare_for_impl_recursion(
             pound_token: Default::default(),
             style: syn::AttrStyle::Outer,
             bracket_token: Default::default(),
-            meta: syn::parse_quote! { #wasm_bindgen::prelude::__wasm_bindgen_class_marker(#class = #js_class #js_namespace_tokens, wasm_bindgen = #wasm_bindgen, wasm_bindgen_futures = #wasm_bindgen_futures, js_sys = #js_sys) },
+            meta: syn::parse_quote! { #wasm_bindgen::prelude::__wasm_bindgen_class_marker(#class = #js_class #js_namespace_tokens #generics_tokens, wasm_bindgen = #wasm_bindgen, wasm_bindgen_futures = #wasm_bindgen_futures, js_sys = #js_sys) },
         },
     );
 
@@ -2007,6 +2501,9 @@ impl MacroParse<&ClassMarker> for &mut syn::ImplItemFn {
             class,
             js_class,
             js_namespace,
+            generics,
+            instantiations,
+            concrete,
             wasm_bindgen,
             wasm_bindgen_futures,
             js_sys,
@@ -2045,22 +2542,6 @@ impl MacroParse<&ClassMarker> for &mut syn::ImplItemFn {
         // attribute only changes the outgoing-argument codegen for imported
         // functions), so we always pass `false` here.
         let args_attrs: Vec<FnArgAttrs> = extract_args_attrs(&mut self.sig, false)?;
-        let (function, method_self) = function_from_decl(
-            &self.sig.ident,
-            &opts,
-            self.sig.clone(),
-            self.attrs.clone(),
-            self.vis.clone(),
-            FunctionPosition::Impl { self_ty: class },
-            Some(args_attrs),
-        )?;
-        let method_kind = if opts.constructor().is_some() {
-            ast::MethodKind::Constructor
-        } else {
-            let is_static = method_self.is_none();
-            let kind = operation_kind(&opts);
-            ast::MethodKind::Operation(ast::Operation { is_static, kind })
-        };
 
         // Validate that js_namespace is not used on methods
         if let Some((_, span)) = opts.js_namespace() {
@@ -2071,28 +2552,249 @@ impl MacroParse<&ClassMarker> for &mut syn::ImplItemFn {
             ));
         }
 
-        program.exports.push(ast::Export {
-            comments,
-            function,
-            js_class: Some(js_class.to_string()),
-            // Propagate the impl-block `js_namespace` so the wasm shim
-            // symbol and the `exported_classes` key are namespace-aware.
-            // Two classes that share a `js_class` in different namespaces
-            // (e.g. `P.Foo` and `Q.Foo`) would otherwise emit colliding
-            // shim symbols and route their methods to the same entry.
-            js_namespace: js_namespace.clone(),
-            method_kind,
-            method_self,
-            rust_class: Some(class.clone()),
-            rust_name: self.sig.ident.clone(),
-            start: ast::StartKind::None,
-            wasm_bindgen: program.wasm_bindgen.clone(),
-            wasm_bindgen_futures: program.wasm_bindgen_futures.clone(),
-            js_sys: program.js_sys.clone(),
-        });
+        // A generic impl is expanded once per instantiation, substituting the
+        // impl's type parameters (and `Self`) with the instantiation's
+        // concrete types in the method signature. A concrete impl of one
+        // instantiation (`impl Foo<Evaluated>` + `js_class`) is a single
+        // target with only `Self` rewritten. A non-generic impl is the
+        // single-target trivial case.
+        let targets: Vec<(String, Option<InstantiationTarget>)> = if let Some(concrete) = concrete {
+            vec![(
+                js_class.to_string(),
+                Some(concrete_impl_target(concrete, js_class)?),
+            )]
+        } else if instantiations.is_empty() {
+            vec![(js_class.to_string(), None)]
+        } else {
+            let param_refs: Vec<&Ident> = generics.iter().collect();
+            instantiations
+                .iter()
+                .map(|inst| {
+                    let target = instantiation_target(inst, class, &param_refs)?;
+                    Ok((target.js_name.clone(), Some(target)))
+                })
+                .collect::<Result<Vec<_>, Diagnostic>>()?
+        };
+
+        for (js_class, target) in targets {
+            let auto = target
+                .as_ref()
+                .filter(|t| !t.ts_params.is_empty())
+                .map(|t| auto_ts_overrides(&self.sig, t, class));
+            let mut sig = self.sig.clone();
+            if let Some(target) = &target {
+                substitute_signature_types(&mut sig, target)?;
+            }
+            let (mut function, method_self) = function_from_decl(
+                &self.sig.ident,
+                &opts,
+                sig,
+                self.attrs.clone(),
+                self.vis.clone(),
+                FunctionPosition::Impl { self_ty: class },
+                Some(args_attrs.clone()),
+            )?;
+            let is_constructor = opts.constructor().is_some();
+            if let Some(auto) = auto {
+                for (arg, auto_ty) in function.arguments.iter_mut().zip(&auto.args) {
+                    if arg.js_type.is_none() {
+                        arg.js_type = auto_ty.clone();
+                    }
+                }
+                if !is_constructor {
+                    if let (Some(ret), Some(auto_ty)) = (function.ret.as_mut(), &auto.ret) {
+                        if ret.js_type.is_none() {
+                            ret.js_type = Some(auto_ty.clone());
+                        }
+                    }
+                }
+                let is_static = method_self.is_none() && !is_constructor;
+                if is_static && !auto.used_params.is_empty() {
+                    let auto_params = auto.used_params.join(", ");
+                    function.ts_params = Some(match function.ts_params.take() {
+                        Some(manual) => format!("{auto_params}, {manual}"),
+                        None => auto_params,
+                    });
+                }
+            }
+            let method_kind = if is_constructor {
+                ast::MethodKind::Constructor
+            } else {
+                let is_static = method_self.is_none();
+                let kind = operation_kind(&opts);
+                ast::MethodKind::Operation(ast::Operation { is_static, kind })
+            };
+
+            program.exports.push(ast::Export {
+                comments: comments.clone(),
+                function,
+                js_class: Some(js_class),
+                // Propagate the impl-block `js_namespace` so the wasm shim
+                // symbol and the `exported_classes` key are namespace-aware.
+                // Two classes that share a `js_class` in different namespaces
+                // (e.g. `P.Foo` and `Q.Foo`) would otherwise emit colliding
+                // shim symbols and route their methods to the same entry.
+                js_namespace: js_namespace.clone(),
+                method_kind,
+                method_self,
+                rust_class: Some(class.clone()),
+                rust_class_generics: target.as_ref().map(|t| t.args.clone()),
+                rust_name: self.sig.ident.clone(),
+                start: ast::StartKind::None,
+                wasm_bindgen: program.wasm_bindgen.clone(),
+                wasm_bindgen_futures: program.wasm_bindgen_futures.clone(),
+                js_sys: program.js_sys.clone(),
+            });
+        }
         opts.check_used();
         Ok(())
     }
+}
+
+/// Per-method TypeScript overrides for a TS-generic instantiation
+/// (`instantiate(Tr<JsValue> as Tr<P>)`), computed from the *original*
+/// generic signature: positions whose type is exactly a Rust type parameter
+/// are typed as the corresponding TS parameter, and positions that are
+/// `Self` (or the base type applied to exactly the parameters) are typed
+/// `Name<P, ...>`. Existing `unchecked_*_type` overrides take precedence.
+struct AutoTsOverrides {
+    /// One entry per typed argument, in order.
+    args: Vec<Option<String>>,
+    ret: Option<String>,
+    /// TS parameters referenced by the overrides, in class declaration
+    /// order. Static methods must redeclare these as method-level type
+    /// parameters — TypeScript statics cannot reference class type params.
+    used_params: Vec<String>,
+}
+
+fn auto_ts_overrides(
+    sig: &syn::Signature,
+    target: &InstantiationTarget,
+    class_ident: &Ident,
+) -> AutoTsOverrides {
+    fn mark_used(used: &mut Vec<String>, ts: &str) {
+        if !used.iter().any(|u| u == ts) {
+            used.push(ts.to_string());
+        }
+    }
+
+    let class_ts_string = || {
+        format!(
+            "{}<{}>",
+            target.js_name,
+            target
+                .ts_params
+                .iter()
+                .map(|(_, ts)| ts.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+
+    let args_are_exactly_params = |args: &syn::AngleBracketedGenericArguments| {
+        args.args.len() == target.ts_params.len()
+            && args
+                .args
+                .iter()
+                .zip(target.ts_params.iter())
+                .all(|(arg, (param, _))| match arg {
+                    syn::GenericArgument::Type(syn::Type::Path(tp)) => {
+                        tp.qself.is_none() && tp.path.is_ident(param)
+                    }
+                    _ => false,
+                })
+    };
+
+    let ts_for_type = |ty: &syn::Type, used: &mut Vec<String>| -> Option<String> {
+        let mut ty = ty;
+        loop {
+            match ty {
+                syn::Type::Group(g) => ty = &g.elem,
+                syn::Type::Paren(p) => ty = &p.elem,
+                syn::Type::Reference(r) => ty = &r.elem,
+                _ => break,
+            }
+        }
+        let syn::Type::Path(tp) = ty else { return None };
+        if tp.qself.is_some() || tp.path.segments.len() != 1 {
+            return None;
+        }
+        let segment = tp.path.segments.last().unwrap();
+        match &segment.arguments {
+            syn::PathArguments::None => {
+                if segment.ident == "Self" {
+                    for (_, ts) in &target.ts_params {
+                        mark_used(used, ts);
+                    }
+                    Some(class_ts_string())
+                } else {
+                    let ts = target
+                        .ts_params
+                        .iter()
+                        .find(|(param, _)| segment.ident == *param)
+                        .map(|(_, ts)| ts.clone())?;
+                    mark_used(used, &ts);
+                    Some(ts)
+                }
+            }
+            syn::PathArguments::AngleBracketed(args) => {
+                if segment.ident == *class_ident && args_are_exactly_params(args) {
+                    for (_, ts) in &target.ts_params {
+                        mark_used(used, ts);
+                    }
+                    Some(class_ts_string())
+                } else {
+                    None
+                }
+            }
+            syn::PathArguments::Parenthesized(_) => None,
+        }
+    };
+
+    let mut used: Vec<String> = Vec::new();
+    let args = sig
+        .inputs
+        .iter()
+        .filter_map(|input| match input {
+            syn::FnArg::Typed(pat_type) => Some(ts_for_type(&pat_type.ty, &mut used)),
+            syn::FnArg::Receiver(_) => None,
+        })
+        .collect();
+    let ret = match &sig.output {
+        syn::ReturnType::Type(_, ty) => ts_for_type(ty, &mut used),
+        syn::ReturnType::Default => None,
+    };
+
+    let used_params = target
+        .ts_params
+        .iter()
+        .map(|(_, ts)| ts)
+        .filter(|ts| used.iter().any(|u| &u == ts))
+        .cloned()
+        .collect();
+
+    AutoTsOverrides {
+        args,
+        ret,
+        used_params,
+    }
+}
+
+/// Substitutes a generic impl's type parameters (and `Self`) with the
+/// concrete types of one instantiation throughout a method signature.
+fn substitute_signature_types(
+    sig: &mut syn::Signature,
+    target: &InstantiationTarget,
+) -> Result<(), Diagnostic> {
+    for input in sig.inputs.iter_mut() {
+        if let syn::FnArg::Typed(pat_type) = input {
+            *pat_type.ty = target.substitute((*pat_type.ty).clone())?;
+        }
+    }
+    if let syn::ReturnType::Type(_, ty) = &mut sig.output {
+        **ty = target.substitute((**ty).clone())?;
+    }
+    Ok(())
 }
 
 fn string_enum(

@@ -252,6 +252,7 @@ fn shared_function<'a>(func: &'a ast::Function, _intern: &'a Interner) -> Functi
         variadic: func.variadic,
         ret_ty_override: func.ret.as_ref().and_then(|v| v.js_type.as_deref()),
         ret_desc: func.ret.as_ref().and_then(|v| v.desc.as_deref()),
+        ts_params: func.ts_params.as_deref(),
     }
 }
 
@@ -477,6 +478,7 @@ fn shared_struct<'a>(s: &'a ast::Struct, intern: &'a Interner) -> Struct<'a> {
             .extends_js_namespace
             .as_ref()
             .map(|ns| ns.iter().map(|s| &**s).collect()),
+        ts_params: s.ts_params.iter().map(|s| &**s).collect(),
     }
 }
 

@@ -1,4 +1,4 @@
-error: structs with #[wasm_bindgen] cannot have lifetime or type parameters currently
+error: structs with #[wasm_bindgen] cannot have lifetime or type parameters unless explicit instantiations are listed, e.g. `#[wasm_bindgen(instantiate(ExportedStructWithGenerics<f64> as ExportedStructWithGenericsF64))]`
  --> ui-tests/invalid-generics.rs:5:34
   |
 5 | struct ExportedStructWithGenerics<T>(T);
